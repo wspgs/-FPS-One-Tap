@@ -1,0 +1,916 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+-- Detach previous instance before re-running.
+if shared.ByteHub then
+	pcall(shared.ByteHub.detach)
+end
+
+local ByteHub = { running = true, connections = {}, drawings = {}, restorers = {} }
+
+-- Constants.
+local MACLIB_URL = "https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"
+local DATA2CODE_URL = "https://raw.githubusercontent.com/Awakenchan/GcViewerV2/refs/heads/main/Utility/Data2Code%40Amity.lua"
+local WEAPON_SOURCE = "WeaponClient"
+local FASTCAST_PATH = { "Common", "Components", "FastCastRedux" }
+local ENTITY_REFRESH = 0.5
+local TRIGGER_DELAY = 0.12
+local AIM_PARTS = { "Head", "Torso", "HumanoidRootPart" }
+
+-- Services.
+local playersService = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local lightingService = game:GetService("Lighting")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local virtualUser = game:GetService("VirtualUser")
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+local mouse = localPlayer:GetMouse()
+local window = nil
+local serializer = nil
+local entities = {}
+local espObjects = {}
+local chamObjects = {}
+local silentPosition = nil
+local silentPart = nil
+local lastTrigger = 0
+local lastError = nil
+local fastCastHooked = false
+local appliedFullbright = false
+local appliedNoFog = false
+local originalLighting = {
+	Brightness = lightingService.Brightness,
+	ClockTime = lightingService.ClockTime,
+	GlobalShadows = lightingService.GlobalShadows,
+	Ambient = lightingService.Ambient,
+	FogEnd = lightingService.FogEnd,
+}
+
+-- Config.
+local Config = {
+	silentEnabled = true,
+	silentPart = "Head",
+	silentFov = 200,
+	silentWall = true,
+	silentHitChance = 100,
+	silentPrediction = 0,
+	silentShowFov = true,
+	triggerBot = false,
+	teamCheck = true,
+	ignoreForceField = true,
+	maxDist = 1500,
+	fovColor = Color3.fromRGB(255, 80, 80),
+
+	espEnabled = true,
+	espBox = true,
+	espName = true,
+	espHealth = true,
+	espTracer = false,
+	espChams = true,
+	espColor = Color3.fromRGB(255, 70, 70),
+
+	speedEnabled = false,
+	speedValue = 40,
+	jumpEnabled = false,
+	jumpValue = 70,
+	infJump = false,
+	noclip = false,
+	fullbright = false,
+	noFog = false,
+	fovEnabled = false,
+	fovValue = 90,
+	antiAfk = true,
+
+	debug = false,
+}
+
+---Always read the live camera because the game can replace it.
+local function getCamera()
+	return workspace.CurrentCamera
+end
+
+---Track a connection so detach can clean it.
+---@param signal RBXScriptSignal
+---@param callback function
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	table.insert(ByteHub.connections, connection)
+	return connection
+end
+
+---Create a Drawing object that detach can remove.
+---@param className string
+local function newDrawing(className)
+	local object = Drawing.new(className)
+	table.insert(ByteHub.drawings, object)
+	return object
+end
+
+---Load Data2Code once (outside of any hook, since request yields).
+local function loadSerializer()
+	if serializer then
+		return
+	end
+
+	local success, response = pcall(request, { Url = DATA2CODE_URL, Method = "GET" })
+	if not (success and response and response.Success) then
+		return
+	end
+
+	local loaded = loadstring(response.Body)
+	if loaded then
+		serializer = loaded()
+	end
+end
+
+---Print which hook layer redirected a shot.
+---@param layer string
+local function debugLog(layer, ...)
+	if not Config.debug then
+		return
+	end
+
+	if serializer then
+		return print("[ByteHub] redirect via " .. layer, serializer.Convert({ ... }, true))
+	end
+
+	print("[ByteHub] redirect via " .. layer)
+end
+
+---Check if a character belongs to a teammate.
+---@param model Model
+local function isTeammate(model)
+	if not Config.teamCheck then
+		return false
+	end
+
+	local player = playersService:GetPlayerFromCharacter(model)
+	return player ~= nil and player.Team ~= nil and player.Team == localPlayer.Team
+end
+
+---Rebuild the list of enemy models (real players plus bots in Workspace).
+local function refreshEntities()
+	table.clear(entities)
+	local seen = {}
+	local localCharacter = localPlayer.Character
+
+	for _, player in ipairs(playersService:GetPlayers()) do
+		local character = player.Character
+		if player == localPlayer or not character or seen[character] then
+			continue
+		end
+
+		seen[character] = true
+		if not isTeammate(character) then
+			table.insert(entities, character)
+		end
+	end
+
+	for _, model in ipairs(workspace:GetChildren()) do
+		if seen[model] or model == localCharacter or not model:IsA("Model") then
+			continue
+		end
+
+		if model:FindFirstChildOfClass("Humanoid") and model:FindFirstChild("HumanoidRootPart") then
+			table.insert(entities, model)
+		end
+	end
+end
+
+---Return humanoid and root if the model is alive.
+---@param model Model
+local function getAlive(model)
+	if not (model and model.Parent) then
+		return nil
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root and humanoid.Health > 0) then
+		return nil
+	end
+
+	return humanoid, root
+end
+
+---Check if a part is unobstructed from the camera.
+---@param part BasePart
+---@param model Model
+local function isVisible(part, model)
+	local camera = getCamera()
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { localPlayer.Character, camera, workspace:FindFirstChild("Effects") }
+
+	local origin = camera.CFrame.Position
+	local result = workspace:Raycast(origin, part.Position - origin, params)
+	return result == nil or result.Instance:IsDescendantOf(model)
+end
+
+---Return the closest valid part to the cursor inside the silent FOV.
+---@return BasePart?, BasePart?
+local function getSilentTarget()
+	local camera = getCamera()
+	local mousePos = userInputService:GetMouseLocation()
+	local bestPart, bestRoot, bestDist = nil, nil, Config.silentFov
+
+	for _, model in ipairs(entities) do
+		local humanoid, root = getAlive(model)
+		if not humanoid then
+			continue
+		end
+
+		if Config.ignoreForceField and model:FindFirstChildOfClass("ForceField") then
+			continue
+		end
+
+		local part = model:FindFirstChild(Config.silentPart) or root
+		if (root.Position - camera.CFrame.Position).Magnitude > Config.maxDist then
+			continue
+		end
+
+		local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+		if not onScreen then
+			continue
+		end
+
+		local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+		if dist > bestDist then
+			continue
+		end
+
+		if Config.silentWall and not isVisible(part, model) then
+			continue
+		end
+
+		bestPart, bestRoot, bestDist = part, root, dist
+	end
+
+	return bestPart, bestRoot
+end
+
+---Pick the silent target and auto fire when enabled.
+local function updateSilent()
+	silentPosition, silentPart = nil, nil
+	if not Config.silentEnabled then
+		return
+	end
+
+	local part, root = getSilentTarget()
+	if not part then
+		return
+	end
+
+	if math.random(1, 100) > Config.silentHitChance then
+		return
+	end
+
+	silentPart = part
+	silentPosition = part.Position + root.AssemblyLinearVelocity * Config.silentPrediction
+
+	-- Auto fire needs the game window focused.
+	if Config.triggerBot and mouse1click and os.clock() - lastTrigger > TRIGGER_DELAY then
+		lastTrigger = os.clock()
+		mouse1click()
+	end
+end
+
+---Point a direction at the silent target while keeping its length.
+---@param origin Vector3
+---@param direction Vector3
+local function redirect(origin, direction)
+	local offset = silentPosition - origin
+	if offset.Magnitude < 0.001 then
+		return direction
+	end
+
+	return offset.Unit * math.max(direction.Magnitude, 1)
+end
+
+---Check that the running code was called from the weapon script.
+local function isWeaponCaller()
+	local callingScript = getcallingscript and getcallingscript()
+	if callingScript and string.find(callingScript.Name, WEAPON_SOURCE, 1, true) then
+		return true
+	end
+
+	for level = 2, 10 do
+		if not debug.isvalidlevel(level) then
+			break
+		end
+
+		local success, source = pcall(debug.info, level, "s")
+		if success and source and string.find(source, WEAPON_SOURCE, 1, true) then
+			return true
+		end
+	end
+
+	return false
+end
+
+---Hook FastCast:Fire so bullets spawn toward the target.
+local function installFastCastHook()
+	local container = replicatedStorage
+	for _, name in ipairs(FASTCAST_PATH) do
+		container = container and container:FindFirstChild(name)
+	end
+
+	if not container then
+		return false
+	end
+
+	-- Drop identity so the game module cannot see our environment.
+	setthreadidentity(2)
+	local success, fastCast = pcall(require, container)
+	setthreadidentity(8)
+
+	if not success or type(fastCast) ~= "table" or type(fastCast.Fire) ~= "function" then
+		return false
+	end
+
+	local oldFire
+	oldFire = hookfunction(fastCast.Fire, newcclosure(function(self, origin, direction, ...)
+		if ByteHub.running and silentPosition and typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
+			if isWeaponCaller() then
+				debugLog("FastCast", origin, direction)
+				return oldFire(self, origin, redirect(origin, direction), ...)
+			end
+		end
+
+		return oldFire(self, origin, direction, ...)
+	end))
+
+	table.insert(ByteHub.restorers, function()
+		restorefunction(fastCast.Fire)
+	end)
+
+	return true
+end
+
+---Hook Raycast and ViewportPointToRay calls made by the weapon script.
+local function installNamecallHook()
+	local oldNamecall
+	oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		if not ByteHub.running or not silentPosition or checkcaller() then
+			return oldNamecall(self, ...)
+		end
+
+		local method = getnamecallmethod()
+
+		if method == "Raycast" and self == workspace then
+			local origin, direction = ...
+			if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" and isWeaponCaller() then
+				debugLog("Raycast", origin, direction)
+				return oldNamecall(self, origin, redirect(origin, direction), select(3, ...))
+			end
+		elseif method == "ViewportPointToRay" or method == "ScreenPointToRay" then
+			if self == getCamera() and isWeaponCaller() then
+				local ray = oldNamecall(self, ...)
+				debugLog(method, ray)
+				return Ray.new(ray.Origin, redirect(ray.Origin, ray.Direction).Unit)
+			end
+		end
+
+		return oldNamecall(self, ...)
+	end))
+end
+
+---Hook Mouse.Hit and Mouse.Target reads made by the weapon script.
+local function installIndexHook()
+	local oldIndex
+	oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+		if key ~= "Hit" and key ~= "Target" then
+			return oldIndex(self, key)
+		end
+
+		if not ByteHub.running or not silentPosition or checkcaller() or self ~= mouse then
+			return oldIndex(self, key)
+		end
+
+		if not isWeaponCaller() then
+			return oldIndex(self, key)
+		end
+
+		debugLog("Mouse." .. key)
+		if key == "Hit" then
+			return CFrame.new(silentPosition)
+		end
+
+		return silentPart
+	end))
+end
+
+-- FOV circle.
+local silentCircle = newDrawing("Circle")
+silentCircle.Thickness = 1
+silentCircle.NumSides = 64
+silentCircle.Filled = false
+
+---Update the silent FOV circle.
+local function updateCircle()
+	silentCircle.Visible = Config.silentEnabled and Config.silentShowFov
+	silentCircle.Radius = Config.silentFov
+	silentCircle.Color = Config.fovColor
+	silentCircle.Position = userInputService:GetMouseLocation()
+end
+
+---Create the Drawing objects used by ESP for a model.
+---@param model Model
+local function createEsp(model)
+	local box = newDrawing("Square")
+	box.Thickness = 1
+	box.Filled = false
+
+	local name = newDrawing("Text")
+	name.Size = 13
+	name.Center = true
+	name.Outline = true
+
+	local healthBack = newDrawing("Line")
+	healthBack.Thickness = 4
+	healthBack.Color = Color3.new(0, 0, 0)
+
+	local healthBar = newDrawing("Line")
+	healthBar.Thickness = 2
+
+	local tracer = newDrawing("Line")
+	tracer.Thickness = 1
+
+	espObjects[model] = { box = box, name = name, healthBack = healthBack, healthBar = healthBar, tracer = tracer }
+end
+
+---Remove ESP objects of a model.
+---@param model Model
+local function removeEsp(model)
+	local objects = espObjects[model]
+	if objects then
+		for _, object in pairs(objects) do
+			pcall(function()
+				object:Remove()
+			end)
+		end
+		espObjects[model] = nil
+	end
+
+	local cham = chamObjects[model]
+	if cham then
+		cham:Destroy()
+		chamObjects[model] = nil
+	end
+end
+
+---Show or hide a highlight on a model.
+---@param model Model
+---@param visible boolean
+local function updateCham(model, visible)
+	local cham = chamObjects[model]
+	if not visible then
+		if cham then
+			cham.Enabled = false
+		end
+		return
+	end
+
+	if not cham then
+		cham = Instance.new("Highlight")
+		cham.FillTransparency = 0.5
+		cham.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		cham.Parent = gethui and gethui() or game:GetService("CoreGui")
+		chamObjects[model] = cham
+	end
+
+	cham.Adornee = model
+	cham.FillColor = Config.espColor
+	cham.OutlineColor = Config.espColor
+	cham.Enabled = true
+end
+
+---Draw ESP for every enemy model.
+local function updateEsp()
+	local camera = getCamera()
+	local present = {}
+
+	-- Sync ESP objects with the entity list.
+	for _, model in ipairs(entities) do
+		present[model] = true
+		if not espObjects[model] then
+			createEsp(model)
+		end
+	end
+
+	for model in pairs(espObjects) do
+		if not present[model] then
+			removeEsp(model)
+		end
+	end
+
+	local viewport = camera.ViewportSize
+
+	for model, objects in pairs(espObjects) do
+		for _, object in pairs(objects) do
+			object.Visible = false
+		end
+
+		local humanoid, root = getAlive(model)
+		local valid = Config.espEnabled and humanoid ~= nil
+		local distance = valid and (root.Position - camera.CFrame.Position).Magnitude or 0
+		if valid and distance > Config.maxDist then
+			valid = false
+		end
+
+		updateCham(model, valid and Config.espChams)
+		if not valid then
+			continue
+		end
+
+		local screenPos, onScreen = camera:WorldToViewportPoint(root.Position)
+		if not onScreen then
+			continue
+		end
+
+		local top = camera:WorldToViewportPoint(root.Position + Vector3.new(0, 2.6, 0))
+		local bottom = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3.2, 0))
+		local height = math.abs(bottom.Y - top.Y)
+		local width = height * 0.55
+		local boxX = screenPos.X - width / 2
+		local color = Config.espColor
+
+		if Config.espBox then
+			objects.box.Size = Vector2.new(width, height)
+			objects.box.Position = Vector2.new(boxX, top.Y)
+			objects.box.Color = color
+			objects.box.Visible = true
+		end
+
+		if Config.espName then
+			objects.name.Text = string.format("%s [%dm]", model.Name, distance)
+			objects.name.Position = Vector2.new(screenPos.X, top.Y - 16)
+			objects.name.Color = color
+			objects.name.Visible = true
+		end
+
+		if Config.espHealth then
+			local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+			local x = boxX - 5
+			objects.healthBack.From = Vector2.new(x, top.Y + height)
+			objects.healthBack.To = Vector2.new(x, top.Y)
+			objects.healthBack.Visible = true
+
+			objects.healthBar.From = Vector2.new(x, top.Y + height)
+			objects.healthBar.To = Vector2.new(x, top.Y + height - height * ratio)
+			objects.healthBar.Color = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), ratio)
+			objects.healthBar.Visible = true
+		end
+
+		if Config.espTracer then
+			objects.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+			objects.tracer.To = Vector2.new(screenPos.X, top.Y + height)
+			objects.tracer.Color = color
+			objects.tracer.Visible = true
+		end
+	end
+end
+
+---Apply or restore lighting changes.
+local function applyLighting()
+	if Config.fullbright then
+		lightingService.Brightness = 2
+		lightingService.ClockTime = 14
+		lightingService.GlobalShadows = false
+		lightingService.Ambient = Color3.fromRGB(200, 200, 200)
+		appliedFullbright = true
+	elseif appliedFullbright then
+		lightingService.Brightness = originalLighting.Brightness
+		lightingService.ClockTime = originalLighting.ClockTime
+		lightingService.GlobalShadows = originalLighting.GlobalShadows
+		lightingService.Ambient = originalLighting.Ambient
+		appliedFullbright = false
+	end
+
+	if Config.noFog then
+		lightingService.FogEnd = 1e6
+		appliedNoFog = true
+	elseif appliedNoFog then
+		lightingService.FogEnd = originalLighting.FogEnd
+		appliedNoFog = false
+	end
+end
+
+---Apply character and camera modifications.
+local function updateMisc()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+	if humanoid then
+		if Config.speedEnabled then
+			humanoid.WalkSpeed = Config.speedValue
+		end
+
+		if Config.jumpEnabled then
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = Config.jumpValue
+		end
+	end
+
+	if Config.fovEnabled then
+		getCamera().FieldOfView = Config.fovValue
+	end
+
+	applyLighting()
+end
+
+---Disable collisions on the local character.
+local function updateNoclip()
+	local character = localPlayer.Character
+	if not (Config.noclip and character) then
+		return
+	end
+
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			part.CanCollide = false
+		end
+	end
+end
+
+---Run every per-frame feature, errors are reported once.
+local function onRenderStep()
+	updateSilent()
+	updateCircle()
+	updateEsp()
+	updateMisc()
+end
+
+---Print a quick health report to help debugging.
+local function diagnose()
+	local actorCount = 0
+	if getactors then
+		actorCount = actorCount + #getactors()
+	end
+	if getdeletedactors then
+		actorCount = actorCount + #getdeletedactors()
+	end
+
+	local weaponVisible = false
+	local success, modules = pcall(getloadedmodules)
+	if success then
+		for _, module in ipairs(modules) do
+			if module.Name == WEAPON_SOURCE then
+				weaponVisible = true
+				break
+			end
+		end
+	end
+
+	print(
+		string.format(
+			"[ByteHub] entities=%d actors=%d weaponClientVisible=%s fastCastHooked=%s",
+			#entities,
+			actorCount,
+			tostring(weaponVisible),
+			tostring(fastCastHooked)
+		)
+	)
+end
+
+---Add a toggle bound to a Config key.
+local function addToggle(section, name, key, onChanged)
+	section:Toggle({
+		Name = name,
+		Default = Config[key],
+		Callback = function(value)
+			Config[key] = value
+			if onChanged then
+				onChanged(value)
+			end
+		end,
+	}, key)
+end
+
+---Add a slider bound to a Config key.
+local function addSlider(section, name, key, minimum, maximum, precision)
+	section:Slider({
+		Name = name,
+		Default = Config[key],
+		Minimum = minimum,
+		Maximum = maximum,
+		DisplayMethod = "Value",
+		Precision = precision or 0,
+		Callback = function(value)
+			Config[key] = value
+		end,
+	}, key)
+end
+
+---Add a dropdown bound to a Config key.
+local function addDropdown(section, name, key, options)
+	section:Dropdown({
+		Name = name,
+		Options = options,
+		Default = table.find(options, Config[key]) or 1,
+		Multi = false,
+		Required = true,
+		Callback = function(value)
+			Config[key] = value
+		end,
+	}, key)
+end
+
+---Add a color picker bound to a Config key.
+local function addColor(section, name, key)
+	section:Colorpicker({
+		Name = name,
+		Default = Config[key],
+		Callback = function(value)
+			Config[key] = value
+		end,
+	}, key)
+end
+
+---Build the Maclib menu.
+local function buildMenu()
+	local response = request({ Url = MACLIB_URL, Method = "GET" })
+	local MacLib = loadstring(response.Body)()
+
+	window = MacLib:Window({
+		Title = "Byte Hub",
+		Subtitle = "Silent Aim",
+		Size = UDim2.fromOffset(660, 480),
+		DragStyle = 1,
+		DisabledWindowControls = {},
+		ShowUserInfo = false,
+		Keybind = Enum.KeyCode.RightShift,
+		AcrylicBlur = true,
+	})
+
+	local tabGroup = window:TabGroup()
+	local silentTab = tabGroup:Tab({ Name = "Silent Aim" })
+	local espTab = tabGroup:Tab({ Name = "ESP" })
+	local miscTab = tabGroup:Tab({ Name = "อื่นๆ" })
+
+	local silentLeft = silentTab:Section({ Side = "Left" })
+	addToggle(silentLeft, "เปิด Silent Aim", "silentEnabled")
+	addDropdown(silentLeft, "ส่วนเป้าหมาย", "silentPart", AIM_PARTS)
+	addSlider(silentLeft, "ขนาด FOV", "silentFov", 30, 600)
+	addSlider(silentLeft, "โอกาสโดน (%)", "silentHitChance", 1, 100)
+	addSlider(silentLeft, "Prediction", "silentPrediction", 0, 0.3, 2)
+
+	local silentRight = silentTab:Section({ Side = "Right" })
+	addToggle(silentRight, "เช็คกำแพง", "silentWall")
+	addToggle(silentRight, "เช็คทีม", "teamCheck", refreshEntities)
+	addToggle(silentRight, "ข้ามคนมีโล่", "ignoreForceField")
+	addToggle(silentRight, "ยิงอัตโนมัติ", "triggerBot")
+	addToggle(silentRight, "แสดงวง FOV", "silentShowFov")
+	addSlider(silentRight, "ระยะสูงสุด", "maxDist", 100, 3000)
+	addColor(silentRight, "สีวง FOV", "fovColor")
+	addToggle(silentRight, "โหมด Debug", "debug", function(value)
+		if value then
+			task.spawn(loadSerializer)
+			task.spawn(diagnose)
+		end
+	end)
+
+	local espLeft = espTab:Section({ Side = "Left" })
+	addToggle(espLeft, "เปิด ESP", "espEnabled")
+	addToggle(espLeft, "กล่อง", "espBox")
+	addToggle(espLeft, "ชื่อ/ระยะ", "espName")
+	addToggle(espLeft, "แถบเลือด", "espHealth")
+
+	local espRight = espTab:Section({ Side = "Right" })
+	addToggle(espRight, "เส้นโยง", "espTracer")
+	addToggle(espRight, "Chams", "espChams")
+	addColor(espRight, "สี ESP", "espColor")
+
+	local miscLeft = miscTab:Section({ Side = "Left" })
+	addToggle(miscLeft, "เพิ่มความเร็ว", "speedEnabled")
+	addSlider(miscLeft, "ความเร็ว", "speedValue", 16, 150)
+	addToggle(miscLeft, "เพิ่มแรงกระโดด", "jumpEnabled")
+	addSlider(miscLeft, "แรงกระโดด", "jumpValue", 50, 200)
+	addToggle(miscLeft, "กระโดดไม่จำกัด", "infJump")
+	addToggle(miscLeft, "ทะลุกำแพง", "noclip")
+
+	local miscRight = miscTab:Section({ Side = "Right" })
+	addToggle(miscRight, "Fullbright", "fullbright")
+	addToggle(miscRight, "ลบหมอก", "noFog")
+	addToggle(miscRight, "ปรับ FOV กล้อง", "fovEnabled")
+	addSlider(miscRight, "ค่า FOV", "fovValue", 60, 120)
+	addToggle(miscRight, "กันหลุด AFK", "antiAfk")
+
+	silentTab:Select()
+end
+
+---Detach everything and restore the game state.
+function ByteHub.detach()
+	ByteHub.running = false
+
+	for _, connection in ipairs(ByteHub.connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+
+	for _, object in ipairs(ByteHub.drawings) do
+		pcall(function()
+			object:Remove()
+		end)
+	end
+
+	for model in pairs(chamObjects) do
+		pcall(function()
+			chamObjects[model]:Destroy()
+		end)
+	end
+
+	for _, restore in ipairs(ByteHub.restorers) do
+		pcall(restore)
+	end
+
+	Config.fullbright, Config.noFog = false, false
+	pcall(applyLighting)
+
+	if window then
+		pcall(function()
+			window:Unload()
+		end)
+	end
+end
+
+---This is called when initialization errors.
+---@param error string
+local function onInitializeError(error)
+	warn("Failed to initialize.")
+	warn(error)
+	warn(debug.traceback())
+	ByteHub.detach()
+end
+
+---Install hooks, build the menu and start the loops.
+local function initializeScript()
+	refreshEntities()
+
+	-- Each hook is independent, one failing must not block the others.
+	local hooks = {
+		function()
+			fastCastHooked = installFastCastHook()
+		end,
+		installNamecallHook,
+		installIndexHook,
+	}
+
+	for _, install in ipairs(hooks) do
+		local success, message = pcall(install)
+		if not success then
+			warn("[ByteHub] hook failed: " .. tostring(message))
+		end
+	end
+
+	local success, message = pcall(buildMenu)
+	if not success then
+		warn("[ByteHub] menu failed, using defaults: " .. tostring(message))
+	end
+
+	connect(runService.RenderStepped, function()
+		local ok, result = pcall(onRenderStep)
+		if not ok and result ~= lastError then
+			lastError = result
+			warn("[ByteHub] render error: " .. tostring(result))
+		end
+	end)
+
+	connect(runService.Stepped, updateNoclip)
+
+	connect(userInputService.JumpRequest, function()
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if Config.infJump and humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end)
+
+	connect(localPlayer.Idled, function()
+		if Config.antiAfk then
+			virtualUser:CaptureController()
+			virtualUser:ClickButton2(Vector2.new())
+		end
+	end)
+
+	task.spawn(function()
+		while ByteHub.running do
+			refreshEntities()
+			task.wait(ENTITY_REFRESH)
+		end
+	end)
+
+	diagnose()
+end
+
+-- Safely initialize the script as well as handle errors.
+shared.ByteHub = ByteHub
+xpcall(initializeScript, onInitializeError)
